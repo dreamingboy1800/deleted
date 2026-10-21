@@ -197,6 +197,20 @@ async def init_db():
             )
         """)
 
+        try:
+            await db.execute("ALTER TABLE auto_responder ADD COLUMN interval_minutes INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS auto_reply_log (
+                connection_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                last_sent_at REAL NOT NULL,
+                PRIMARY KEY (connection_id, chat_id)
+            )
+        """)
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS auto_pending (
                 owner_user_id INTEGER PRIMARY KEY,
@@ -1466,37 +1480,43 @@ def build_auto_reply(user_text: str) -> str:
     )
 
 
-def auto_settings_keyboard(
-    enabled: bool
-):
+def auto_settings_keyboard(enabled: bool, interval_minutes: int = 0):
+    def mark(value):
+        return "✅ " if interval_minutes == value else ""
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=(
-                        "🔴 Выключить"
-                        if enabled
-                        else
-                        "🟢 Включить"
-                    ),
-                    callback_data="auto_toggle",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✏️ Изменить ответ",
-                    callback_data="auto_edit",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="◀️ Назад",
-                    callback_data="back_to_start",
-                )
-            ],
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("🔴 Выключить" if enabled else "🟢 Включить"), callback_data="auto_toggle")],
+        [InlineKeyboardButton(text=f"{mark(0)}⚡ Каждое сообщение", callback_data="auto_interval_0")],
+        [
+            InlineKeyboardButton(text=f"{mark(5)}🕔 Раз в 5 минут", callback_data="auto_interval_5"),
+            InlineKeyboardButton(text=f"{mark(10)}🕙 Раз в 10 минут", callback_data="auto_interval_10"),
+        ],
+        [InlineKeyboardButton(text=f"{mark(15)}🕒 Раз в 15 минут", callback_data="auto_interval_15")],
+        [InlineKeyboardButton(text="✏️ Изменить ответ", callback_data="auto_edit")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")],
+    ])
+
+
+async def get_auto_interval(connection_id: str) -> int:
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute(
+            "SELECT interval_minutes FROM auto_responder WHERE connection_id = ? LIMIT 1",
+            (connection_id,),
+        )
+        row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def set_auto_interval(connection_id: str, interval_minutes: int):
+    if interval_minutes not in (0, 5, 10, 15):
+        raise ValueError("Недопустимый интервал автоответчика")
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            INSERT INTO auto_responder (connection_id, enabled, reply_text, interval_minutes)
+            VALUES (?, 0, ?, ?)
+            ON CONFLICT(connection_id) DO UPDATE SET interval_minutes = excluded.interval_minutes
+        """, (connection_id, DEFAULT_AUTO_REPLY, interval_minutes))
+        await db.commit()
 
 
 async def get_owner_connection(
@@ -1820,6 +1840,19 @@ async def process_auto_reply(
     if not enabled:
         return False
 
+    interval_minutes = await get_auto_interval(connection_id)
+    now = time.time()
+    if interval_minutes > 0:
+        async with aiosqlite.connect(DB_FILE) as db:
+            cursor = await db.execute(
+                "SELECT last_sent_at FROM auto_reply_log WHERE connection_id = ? AND chat_id = ? LIMIT 1",
+                (connection_id, message.chat.id),
+            )
+            row = await cursor.fetchone()
+        if row and now - float(row[0]) < interval_minutes * 60:
+            logging.info("AUTO REPLY SKIPPED | connection=%s | chat=%s", connection_id, message.chat.id)
+            return True
+
     final_reply = build_auto_reply(
         reply_text
     )
@@ -1832,6 +1865,16 @@ async def process_auto_reply(
             business_connection_id=connection_id,
             parse_mode="HTML",
         )
+
+        if interval_minutes > 0:
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute("""
+                    INSERT INTO auto_reply_log (connection_id, chat_id, last_sent_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(connection_id, chat_id)
+                    DO UPDATE SET last_sent_at = excluded.last_sent_at
+                """, (connection_id, message.chat.id, now))
+                await db.commit()
 
         logging.info(
             "AUTO REPLY SENT | connection=%s | chat=%s | sender=%s",
@@ -1893,13 +1936,17 @@ async def auto_settings_handler(
         connection_id
     )
 
+    interval_minutes = await get_auto_interval(connection_id)
+    interval_label = {0: "⚡ Каждое сообщение", 5: "🕔 Раз в 5 минут", 10: "🕙 Раз в 10 минут", 15: "🕒 Раз в 15 минут"}.get(interval_minutes, "⚡ Каждое сообщение")
+
     await callback.answer()
 
     text = (
         "🤖 <b>Автоответчик</b>\n\n"
 
         f"Статус: "
-        f"{'🟢 включён' if enabled else '🔴 выключен'}\n\n"
+        f"{'🟢 включён' if enabled else '🔴 выключен'}\n"
+        f"<b>Частота автоответа:</b> {interval_label}\n\n"
 
         "<b>Текущий ответ:</b>\n"
         f"{html.escape(reply_text)}\n\n"
@@ -1919,7 +1966,7 @@ async def auto_settings_handler(
         await callback.message.edit_text(
             text,
             reply_markup=auto_settings_keyboard(
-                enabled
+                enabled, interval_minutes
             ),
             parse_mode="HTML",
         )
@@ -1929,7 +1976,7 @@ async def auto_settings_handler(
         await callback.message.answer(
             text,
             reply_markup=auto_settings_keyboard(
-                enabled
+                enabled, interval_minutes
             ),
             parse_mode="HTML",
         )
@@ -1963,6 +2010,8 @@ async def auto_toggle_handler(
     enabled, reply_text = await get_auto_settings(
         connection_id
     )
+    interval_minutes = await get_auto_interval(connection_id)
+    interval_label = {0: "⚡ Каждое сообщение", 5: "🕔 Раз в 5 минут", 10: "🕙 Раз в 10 минут", 15: "🕒 Раз в 15 минут"}.get(interval_minutes, "⚡ Каждое сообщение")
 
     enabled = not enabled
 
@@ -2000,10 +2049,41 @@ async def auto_toggle_handler(
     await callback.message.edit_text(
         text,
         reply_markup=auto_settings_keyboard(
-            enabled
+            enabled, interval_minutes
         ),
         parse_mode="HTML",
     )
+
+
+# ============================================================
+# AUTO REPLY INTERVAL
+# ============================================================
+
+@router.callback_query(lambda callback: callback.data in {
+    "auto_interval_0", "auto_interval_5", "auto_interval_10", "auto_interval_15",
+})
+async def auto_interval_handler(callback: CallbackQuery):
+    connection_id = await get_owner_connection(callback.from_user.id)
+    if not connection_id:
+        await callback.answer("🔴 Business не подключён", show_alert=True)
+        return
+
+    interval_minutes = int(callback.data.rsplit("_", 1)[1])
+    await set_auto_interval(connection_id, interval_minutes)
+    labels = {0: "⚡ Каждое сообщение", 5: "🕔 Раз в 5 минут", 10: "🕙 Раз в 10 минут", 15: "🕒 Раз в 15 минут"}
+    enabled, reply_text = await get_auto_settings(connection_id)
+    await callback.answer("✅ Частота обновлена")
+    text = (
+        "🤖 <b>Автоответчик</b>\n\n"
+        f"Статус: {'🟢 включён' if enabled else '🔴 выключен'}\n"
+        f"<b>Частота автоответа:</b> {labels[interval_minutes]}\n\n"
+        "<b>Текущий ответ:</b>\n"
+        f"{html.escape(reply_text)}\n\n"
+        "✨ <i>К каждому автоответу автоматически добавляется:</i>\n\n"
+        f'✨ <i>Это бесплатный автоответчик от бота <a href="{BOT_URL}">{BOT_USERNAME}</a> 😉</i>\n\n'
+        "Эта подпись фиксированная и <b>не изменяется</b>."
+    )
+    await callback.message.edit_text(text, reply_markup=auto_settings_keyboard(enabled, interval_minutes), parse_mode="HTML")
 
 
 # ============================================================
@@ -2183,7 +2263,7 @@ async def auto_text_input_handler(
         "<b>не изменяется</b>.",
 
         reply_markup=auto_settings_keyboard(
-            enabled
+            enabled, await get_auto_interval(connection_id)
         ),
 
         parse_mode="HTML",
